@@ -80,22 +80,38 @@ def api_status():
 def get_authenticated_service():
     """Autentica com google usando o token local já existente (CLOUD MODE: sem fluxo interativo)"""
     creds = None
+    
+    # Suporte a credenciais via Variável de Ambiente (Cloud Native)
+    env_token = os.environ.get('GOOGLE_TOKEN_JSON')
+    
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    elif env_token:
+        try:
+            token_dict = json.loads(env_token)
+            creds = Credentials.from_authorized_user_info(token_dict, SCOPES)
+        except Exception as e:
+            print(f"⚠️ Erro ao carregar token da variável de ambiente: {e}")
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
-                # Persist refreshed token
-                with open(TOKEN_FILE, 'w') as token:
-                    token.write(creds.to_json())
+                
+                # Atualizar o token dependendo de onde ele veio
+                if os.path.exists(TOKEN_FILE):
+                    with open(TOKEN_FILE, 'w') as token:
+                        token.write(creds.to_json())
+                else:
+                    # Em cloud (via ENV), imprime no log pra avisar da renovação
+                    print("✅ [AUTH] Token renovado na memória. Atualize no Coolify quando puder.")
             except Exception as e:
                 print(f"⚠️ Erro ao atualizar token da API: {e}")
                 raise RuntimeError(f"Token Google expirado e não pôde ser renovado: {e}")
 
         if not creds:
             # CLOUD MODE: Não pode abrir browser para OAuth interativo
-            raise RuntimeError("Token Google não encontrado ou inválido. Copie um token.json válido para o container.")
+            raise RuntimeError("Token Google não encontrado ou inválido. Adicione a variável GOOGLE_TOKEN_JSON no Coolify.")
     
     return gspread.authorize(creds)
 
