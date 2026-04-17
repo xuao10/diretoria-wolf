@@ -66,17 +66,68 @@ def debug_path():
         "sys_path": sys.path
     }
 
+CLICKUP_PRODUCTION_TTL = int(os.environ.get("CLICKUP_PRODUCTION_TTL", 60))
+_clickup_refresh_lock = threading.Lock()
+_clickup_refreshing = {"v": False}
+
+
+def _refresh_clickup_production_async(force_refresh=False):
+    """Refresca cache de produção em background. Única execução por vez."""
+    with _clickup_refresh_lock:
+        if _clickup_refreshing["v"]:
+            return
+        _clickup_refreshing["v"] = True
+    try:
+        data = clickup_sync.get_production_metrics(force_refresh=force_refresh)
+        if data.get("status") != "error":
+            wolf_cache.save_cache("clickup_production", data)
+    except Exception as e:
+        print(f"⚠️ Erro refrescando clickup_production em background: {e}")
+    finally:
+        with _clickup_refresh_lock:
+            _clickup_refreshing["v"] = False
+
+
 @app.route('/api/clickup/production', methods=['GET'])
 def get_clickup_production():
-    """Retorna metricas de producao do ClickUp."""
+    """Retorna metricas de producao do ClickUp (cache-first com stale-while-revalidate)."""
+    force = request.args.get('refresh') == '1'
+    cached, _ = wolf_cache.load_cache("clickup_production")
+    age = wolf_cache.cache_age_seconds("clickup_production")
+
+    # Cache fresco: serve direto
+    if cached is not None and not force and age is not None and age < CLICKUP_PRODUCTION_TTL:
+        response = jsonify(sanitize_nan(cached))
+        response.headers['X-Cache'] = f'HIT age={int(age)}s'
+        return response
+
+    # Cache velho mas existe: serve stale + dispara refresh em background
+    if cached is not None and not force:
+        threading.Thread(
+            target=_refresh_clickup_production_async,
+            kwargs={"force_refresh": False},
+            daemon=True,
+            name="ClickupRefresh",
+        ).start()
+        response = jsonify(sanitize_nan(cached))
+        response.headers['X-Cache'] = f'STALE age={int(age) if age else -1}s refreshing'
+        return response
+
+    # Sem cache ou refresh forçado: síncrono
     try:
-        data = clickup_sync.get_production_metrics()
+        data = clickup_sync.get_production_metrics(force_refresh=force)
+        if data.get("status") != "error":
+            wolf_cache.save_cache("clickup_production", data)
         response = jsonify(sanitize_nan(data))
+        response.headers['X-Cache'] = 'MISS' if not force else 'FORCE'
         response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
-        response.headers['Pragma'] = 'no-cache'
-        response.headers['Expires'] = '0'
         return response
     except Exception as e:
+        # Fallback pro cache antigo se existir
+        if cached is not None:
+            response = jsonify(sanitize_nan(cached))
+            response.headers['X-Cache'] = 'ERROR-fallback'
+            return response
         return jsonify({"status": "error", "error": str(e)}), 500
 
 @app.route('/api/status', methods=['GET'])

@@ -4,8 +4,17 @@ import json
 import traceback
 import unicodedata
 import sys
+import concurrent.futures
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+
+try:
+    import wolf_cache as _wolf_cache
+except Exception:
+    _wolf_cache = None
+
+HISTORICAL_SPRINT_TTL = int(os.environ.get("CLICKUP_HIST_SPRINT_TTL", 86400))  # 24h
+HISTORICAL_PARALLELISM = int(os.environ.get("CLICKUP_HIST_PARALLELISM", 6))
 
 env_path = os.path.join(os.path.dirname(__file__), 'wolf_factory.env')
 load_dotenv(env_path)
@@ -679,6 +688,90 @@ def fetch_list_details(list_id):
         return {}
 
 
+def _historical_cache_age(sp_id):
+    if _wolf_cache is None:
+        return None
+    try:
+        return _wolf_cache.cache_age_seconds(f"sprint_hist_{sp_id}")
+    except Exception:
+        return None
+
+
+def _load_historical_cache(sp_id):
+    if _wolf_cache is None:
+        return None
+    age = _historical_cache_age(sp_id)
+    if age is None or age > HISTORICAL_SPRINT_TTL:
+        return None
+    data, _ = _wolf_cache.load_cache(f"sprint_hist_{sp_id}")
+    return data
+
+
+def _save_historical_cache(sp_id, data):
+    if _wolf_cache is None:
+        return
+    try:
+        _wolf_cache.save_cache(f"sprint_hist_{sp_id}", data)
+    except Exception as e:
+        print(f"  Warn: falha ao salvar cache do sprint {sp_id}: {e}")
+
+
+def _process_historical_sprint(sp_id, force_refresh=False):
+    """Fetch + agrega métricas de um sprint histórico. Usa cache de 24h por padrão."""
+    if not force_refresh:
+        cached = _load_historical_cache(sp_id)
+        if cached is not None:
+            print(f"  [cache HIT] sprint {sp_id}")
+            return cached
+
+    view_id = SPRINT_VIEW_MAP.get(sp_id)
+    if view_id:
+        print(f"Fetching historical sprint {sp_id} via View: {view_id}")
+        tasks = fetch_view_tasks(view_id)
+    else:
+        print(f"Fetching historical sprint {sp_id} via List API")
+        tasks = fetch_list_tasks(sp_id)
+
+    print(f"  {len(tasks)} tasks for historical sprint {sp_id}")
+    pilots = process_sprint_tasks(tasks)
+
+    parent_ids = {t.get('parent') for t in tasks if t.get('parent') is not None}
+    sp_lt_data = []
+    for t in tasks:
+        if t.get('status', {}).get('type') in ('closed', 'done'):
+            is_mother = t.get('id') in parent_ids
+            pts = t.get('points') or 0
+            time_tracked_ms = t.get('time_spent') or 0
+            if not is_mother and pts > 0 and time_tracked_ms > 0:
+                lt_hours = time_tracked_ms / (1000 * 60 * 60)
+                sp_lt_data.append({"value": lt_hours, "points": pts})
+
+    sum_w = sum(x["value"] * x["points"] for x in sp_lt_data)
+    sum_p = sum(x["points"] for x in sp_lt_data)
+    sp_lead_time_avg = round(sum_w / sum_p, 1) if sum_p > 0 else 0
+
+    sprint_done_all = sum(p["done"] for p in pilots)
+    sprint_done_hid = sum(p["done"] for p in pilots if p["team"] == "HID")
+    sprint_done_ele = sum(p["done"] for p in pilots if p["team"] == "ELE")
+    sprint_done_academy = sum(p["done"] for p in pilots if p.get("isAcademy"))
+    sprint_total_pts = sum(t.get('points') or 0 for t in tasks)
+    sprint_label = SPRINT_LABEL_MAP.get(sp_id, f'Sprint {sp_id}')
+
+    result = {
+        'sp_id': sp_id,
+        'sprint_label': sprint_label,
+        'pilots': pilots,
+        'sprint_done_all': sprint_done_all,
+        'sprint_done_hid': sprint_done_hid,
+        'sprint_done_ele': sprint_done_ele,
+        'sprint_done_academy': sprint_done_academy,
+        'sprint_total_pts': sprint_total_pts,
+        'sp_lead_time_avg': sp_lead_time_avg,
+    }
+    _save_historical_cache(sp_id, result)
+    return result
+
+
 def process_sprint_tasks(tasks):
     """Process tasks into pilot metrics with discipline, photos, and status tracking."""
     pilots_map = {}
@@ -826,7 +919,7 @@ def process_sprint_tasks(tasks):
     return pilots
 
 
-def get_production_metrics():
+def get_production_metrics(force_refresh=False):
     if not CLICKUP_TOKEN:
         return {"error": "Missing ClickUp API token.", "status": "error"}
 
@@ -1055,59 +1148,48 @@ def get_production_metrics():
     pilot_sprint_history = {}   # {norm_name: {sprint_label: done_pts}}
     tier_sprint_done = {}       # {tier_name: {sprint_label: [done_pts per member]}}
     
-    for sp_id in SPRINT_IDS:
-        sp_id = sp_id.strip()
-        if not sp_id or sp_id == CURRENT_SPRINT_ID:
-            continue
-            
-        view_id = SPRINT_VIEW_MAP.get(sp_id)
-        if view_id:
-            print(f"Fetching historical sprint {sp_id} via View: {view_id}")
-            tasks = fetch_view_tasks(view_id)
-        else:
-            print(f"Fetching historical sprint {sp_id} via List API")
-            tasks = fetch_list_tasks(sp_id)
-            
-        print(f"  {len(tasks)} tasks for historical sprint {sp_id}")
-        pilots = process_sprint_tasks(tasks)
-        
-        # --- LEAD TIME HISTÓRICO (Baseado em Rastreamento) ---
-        parent_ids = {t.get('parent') for t in tasks if t.get('parent') is not None}
-        sp_lt_data = []
-        for t in tasks:
-            if t.get('status', {}).get('type') in ('closed', 'done'):
-                is_mother = t.get('id') in parent_ids
-                pts = t.get('points') or 0
-                time_tracked_ms = t.get('time_spent') or 0
-                if not is_mother and pts > 0 and time_tracked_ms > 0:
-                    lt_hours = time_tracked_ms / (1000 * 60 * 60)
-                    sp_lt_data.append({"value": lt_hours, "points": pts})
-        
-        sum_w = sum(x["value"] * x["points"] for x in sp_lt_data)
-        sum_p = sum(x["points"] for x in sp_lt_data)
-        sp_lead_time_avg = round(sum_w / sum_p, 1) if sum_p > 0 else 0
-        # ---------------------------------------------------
-        
-        # ── NEW PE LOGIC: Include Academy in team totals ──
-        # TODOS: All done points (seniors + Academy + everyone)
-        sprint_done_all = sum(p["done"] for p in pilots)
-        # HID: All HID done points (including Academy HID)
-        sprint_done_hid = sum(p["done"] for p in pilots if p["team"] == "HID")
-        # ELE: All ELE done points (including Academy ELE)
-        sprint_done_ele = sum(p["done"] for p in pilots if p["team"] == "ELE")
-        # ACADEMY: Only Academy done points (isolated)
-        sprint_done_academy = sum(p["done"] for p in pilots if p.get("isAcademy"))
-        
-        sprint_total_pts = sum(t.get('points') or 0 for t in tasks)
+    sprint_ids_to_process = [
+        sid.strip() for sid in SPRINT_IDS
+        if sid and sid.strip() and sid.strip() != CURRENT_SPRINT_ID
+    ]
+
+    historical_results = []
+    if sprint_ids_to_process:
+        workers = max(1, min(HISTORICAL_PARALLELISM, len(sprint_ids_to_process)))
+        print(f"Processing {len(sprint_ids_to_process)} historical sprints em paralelo (workers={workers})")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            future_map = {
+                ex.submit(_process_historical_sprint, sid, force_refresh): sid
+                for sid in sprint_ids_to_process
+            }
+            for fut in concurrent.futures.as_completed(future_map):
+                sid = future_map[fut]
+                try:
+                    historical_results.append(fut.result())
+                except Exception as e:
+                    print(f"  Erro processando sprint {sid}: {e}")
+
+    # Ordem estável: seguindo SPRINT_IDS original
+    order_index = {sid: i for i, sid in enumerate(sprint_ids_to_process)}
+    historical_results.sort(key=lambda r: order_index.get(r['sp_id'], 1_000_000))
+
+    for r in historical_results:
+        sp_id = r['sp_id']
+        pilots = r['pilots']
+        sprint_done_all = r['sprint_done_all']
+        sprint_done_hid = r['sprint_done_hid']
+        sprint_done_ele = r['sprint_done_ele']
+        sprint_done_academy = r['sprint_done_academy']
+        sprint_total_pts = r['sprint_total_pts']
+        sp_lead_time_avg = r['sp_lead_time_avg']
+        sprint_label = r['sprint_label']
 
         historical_pe_total += sprint_done_all
         historical_pe_hid += sprint_done_hid
         historical_pe_ele += sprint_done_ele
         historical_pe_academy += sprint_done_academy
         historical_sprint_count += 1
-        
-        # Store per-sprint velocity for frontend chart
-        sprint_label = SPRINT_LABEL_MAP.get(sp_id, f'Sprint {sp_id}')
+
         history[sp_id] = {
             'pilots': pilots,
             'velocity_total': sprint_done_all,
@@ -1120,7 +1202,6 @@ def get_production_metrics():
         }
         print(f"  Sprint {sp_id} Done All: {sprint_done_all} (HID: {sprint_done_hid}, ELE: {sprint_done_ele}, Academy: {sprint_done_academy})")
 
-        # Armazena velocity individual do sprint para seleção TOP-3
         sprint_velocities.append({
             'total': sprint_done_all,
             'hid': sprint_done_hid,
@@ -1129,14 +1210,12 @@ def get_production_metrics():
             'label': sprint_label
         })
 
-        # ── PE TRIPLO: Collect per-pilot Done and per-tier Done ──
         for hp in pilots:
             norm = normalize_string(hp["name"])
             tier = hp.get("tier", _MEMBER_TIER.get(norm, "MESMA_PRATELEIRA"))
             team = hp.get("team", hp.get("disc", "Geral"))
             tier_team_key = f"{tier}_{team}"
             done_v = hp["done"]
-            # Per-pilot history (NORMALIZADO para 40h para média justa)
             h_factor = hp.get("hours_week", 40) / 40.0
             if h_factor <= 0: h_factor = 1.0
             done_normalized = done_v / h_factor
@@ -1145,12 +1224,11 @@ def get_production_metrics():
                 pilot_sprint_history[norm] = {}
             pilot_sprint_history[norm][sprint_label] = done_normalized
 
-            # Per-tier history por disciplina/equipe
             if tier_team_key not in tier_sprint_done:
                 tier_sprint_done[tier_team_key] = {}
             if sprint_label not in tier_sprint_done[tier_team_key]:
                 tier_sprint_done[tier_team_key][sprint_label] = []
-            
+
             tier_sprint_done[tier_team_key][sprint_label].append(done_normalized)
 
     # Calculate average historical velocity using TOP-3 BEST sprints (by total velocity)
