@@ -1,26 +1,37 @@
-FROM nginx:alpine
+FROM python:3.11-slim
 
-# Remove default nginx page
-RUN rm -rf /usr/share/nginx/html/*
+WORKDIR /app
 
-# Copy static files
-COPY index.html /usr/share/nginx/html/
-COPY public/ /usr/share/nginx/html/public/
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# Custom nginx config for SPA
-RUN echo 'server { \
-    listen 80; \
-    server_name _; \
-    root /usr/share/nginx/html; \
-    index index.html; \
-    location / { \
-        try_files $uri $uri/ /index.html; \
-    } \
-    gzip on; \
-    gzip_types text/plain text/css application/json application/javascript text/xml application/xml text/javascript image/svg+xml; \
-    gzip_min_length 1000; \
-}' > /etc/nginx/conf.d/default.conf
+# Copy requirements first for better caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-EXPOSE 80
+# Copy application code
+COPY dashboard_api.py .
+COPY clickup_sync.py .
+COPY wolf_cache.py .
+COPY wolf_watcher.py .
+COPY cao_de_guarda.py .
+COPY wolf_factory.env .
+COPY client_secret.json .
+COPY token.json .
 
-CMD ["nginx", "-g", "daemon off;"]
+# Create cache directory
+RUN mkdir -p /app/.wolf_cache
+
+# Create empty directories that the code references (stubs for cloud mode)
+RUN mkdir -p /app/wolf-factory-hq
+
+# Environment
+ENV PYTHONUNBUFFERED=1
+ENV WOLF_CLOUD_MODE=1
+
+EXPOSE 6061
+
+# Use gunicorn for production
+CMD ["gunicorn", "--bind", "0.0.0.0:6061", "--workers", "2", "--timeout", "120", "--access-logfile", "-", "dashboard_api:app"]

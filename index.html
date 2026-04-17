@@ -4305,7 +4305,7 @@
 
         console.log("📡 fetchChecklistData: Requesting...");
 
-        const res = await fetch('/api/checklists');
+        const res = await fetch(window.WOLF_API_BASE + '/api/checklists');
 
         const data = await res.json();
 
@@ -9122,7 +9122,7 @@
       `;
 
       // Call verification API
-      const apiUrl = `/api/verify-issue?id=${issueId}&project=${encodeURIComponent(issue.raw_project || '')}&desc=${encodeURIComponent(issue.desc)}`;
+      const apiUrl = `${window.WOLF_API_BASE}/api/verify-issue?id=${issueId}&project=${encodeURIComponent(issue.raw_project || '')}&desc=${encodeURIComponent(issue.desc)}`;
 
       fetch(apiUrl)
         .then(r => r.json())
@@ -9368,7 +9368,7 @@
 
 
     // --- GLOBAL DATA STATE ---
-    window.WOLF_API_BASE = "http://localhost:6061";
+    window.WOLF_API_BASE = "https://motor.wolfengenhariabim.com";
     window.wolfIssues = [];
     window.checklistDataV2 = { predictive: [], critical_ranking_v3: {}, summary_logs: [], raw_logs: [] };
     window.activeWeightFilters = [];

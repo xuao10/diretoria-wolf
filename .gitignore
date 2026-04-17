@@ -22,3 +22,11 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Backend Secrets & Caches
+wolf_factory.env
+.env
+token.json
+client_secret.json
+__pycache__
+.wolf_cache
