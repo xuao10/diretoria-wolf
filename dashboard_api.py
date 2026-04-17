@@ -96,6 +96,14 @@ def get_authenticated_service():
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
     elif env_token:
         try:
+            # Limpa escapes e aspas duplas desnecessárias que possam ser inseridas pelas Variaveis de Ambiente da plataforma
+            if env_token.startswith("'") and env_token.endswith("'"):
+                env_token = env_token[1:-1]
+            if env_token.startswith('"') and env_token.endswith('"'):
+                env_token = env_token[1:-1]
+            # Replace internal escaped quotes if present
+            env_token = env_token.replace('\\"', '"')
+            
             token_dict = json.loads(env_token)
             creds = Credentials.from_authorized_user_info(token_dict, SCOPES)
         except Exception as e:
