@@ -35,15 +35,23 @@ SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 TOKEN_FILE = os.path.join(SCRIPT_DIR, 'token.json')
 CRED_FILE = os.path.join(SCRIPT_DIR, 'client_secret.json')
 
-DASHBOARD_DIR = os.path.join(SCRIPT_DIR, 'wolf-factory-hq')
-app = Flask(__name__, static_folder=DASHBOARD_DIR)
+DASHBOARD_DIR = os.path.abspath(SCRIPT_DIR)
+# Configura o Flask para servir arquivos estáticos a partir do diretório raiz
+app = Flask(__name__, static_folder=DASHBOARD_DIR, static_url_path='')
 CORS(app, origins=["https://diretoria.wolfengenhariabim.com", "http://localhost:6061", "http://localhost:5173", "*"])
 app.config['JSON_AS_ASCII'] = False # Força o retorno em UTF-8 nativo para as chaves acentuadas
 
 @app.route('/')
 def serve_dashboard():
-    """Health check / landing page for the API."""
-    return jsonify({"status": "online", "service": "Motor Wolf API", "version": "5.0"})
+    """Serve o Dashboard HTML principal."""
+    # O Flask já servirá index.html automaticamente da raiz pois static_url_path='', 
+    # mas garantimos na rota /
+    return app.send_static_file('index.html')
+
+@app.route('/<path:path>')
+def serve_static_fallback(path):
+    """Fallback para arquivos que não caíram na rota estática padrão"""
+    return app.send_static_file(path)
 
 import clickup_sync
 

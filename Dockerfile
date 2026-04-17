@@ -1,9 +1,27 @@
-FROM nginx:alpine
-# Copy static files to nginx html directory
-COPY . /usr/share/nginx/html
+FROM python:3.11-slim
 
-# Gzip compression for faster loading
-RUN echo "gzip on; gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript; gzip_min_length 1000;" > /etc/nginx/conf.d/gzip.conf
+WORKDIR /app
 
-EXPOSE 80
-CMD ["nginx", "-g", "daemon off;"]
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copia TODOS os arquivos do projeto (Backend + Frontend)
+COPY . /app/
+
+# Cria pasta de cache
+RUN mkdir -p /app/.wolf_cache
+
+# Environment
+ENV PYTHONUNBUFFERED=1
+ENV WOLF_CLOUD_MODE=1
+
+EXPOSE 6061
+
+# Usar gunicorn para produção com a porta 6061 exposta
+CMD ["gunicorn", "--bind", "0.0.0.0:6061", "--workers", "2", "--timeout", "120", "--access-logfile", "-", "dashboard_api:app"]
