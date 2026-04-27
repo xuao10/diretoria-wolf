@@ -3473,6 +3473,10 @@
                 <span id="prod-velocity" class="text-lg font-black text-white font-mono">738</span>
                 <span class="text-[9px] text-gray-500 font-mono">pts</span>
               </div>
+              <!-- Export JSON -->
+              <button id="prod-btn-export" onclick="ProductionDirector.exportJSON()" title="Baixa o JSON completo com todas as metricas processadas (PE Sprint/Calibrada/Individual, carga, telemetria, burndown, lead time, etc.)" class="bg-black/50 border border-emerald-500/30 hover:border-emerald-400 hover:bg-emerald-500/10 rounded-xl px-4 py-2 text-[10px] font-mono font-bold text-emerald-400 transition-all shadow-inner">
+                ⬇ EXPORTAR JSON
+              </button>
             </div>
           </div>
 
@@ -10887,7 +10891,52 @@
 
       function stop() {}
 
-      return { init: init, stop: stop, refreshAll: refreshAll, setTeamFilter: setTeamFilter, openDesempenho: openDesempenho };
+      function exportJSON() {
+        var btn = document.getElementById('prod-btn-export');
+        var origText = btn ? btn.textContent : '';
+        if (btn) { btn.textContent = '⏳ EXPORTANDO...'; btn.disabled = true; }
+        // Sempre busca a versao mais fresca pra exportar (ignora cache local)
+        fetch('/api/clickup/production?refresh=1', { cache: 'no-store' })
+          .then(function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+          })
+          .then(function(data) {
+            var nowIso = new Date().toISOString();
+            var sprintLabel = (data.current_sprint_label || 'sprint').toLowerCase().replace(/\s+/g, '_');
+            var datePart = nowIso.slice(0, 10);
+            var payload = {
+              exported_at: nowIso,
+              source: 'wolf_dashboard_production',
+              endpoint: '/api/clickup/production',
+              sprint: {
+                id: data.current_sprint_id || null,
+                label: data.current_sprint_label || null,
+                start_date: data.sprint_start_date || null,
+                dias_uteis_total: data.dias_uteis_total || null,
+                dias_uteis_passados: data.dias_uteis_passados || null
+              },
+              metrics: data
+            };
+            var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = 'wolf_metrics_' + sprintLabel + '_' + datePart + '.json';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+            if (btn) { btn.textContent = '✓ BAIXADO'; setTimeout(function() { btn.textContent = origText; btn.disabled = false; }, 1500); }
+          })
+          .catch(function(err) {
+            console.error('[export] falhou:', err);
+            if (btn) { btn.textContent = '✗ ERRO'; setTimeout(function() { btn.textContent = origText; btn.disabled = false; }, 2000); }
+            alert('Falha ao exportar: ' + (err && err.message ? err.message : err));
+          });
+      }
+
+      return { init: init, stop: stop, refreshAll: refreshAll, setTeamFilter: setTeamFilter, openDesempenho: openDesempenho, exportJSON: exportJSON };
     })();
 
 
