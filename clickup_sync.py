@@ -1,6 +1,8 @@
 import os
+import re
 import urllib.request
 import json
+import threading
 import traceback
 import unicodedata
 import sys
@@ -64,6 +66,200 @@ for _sp_id, _label in SPRINT_LABEL_MAP.items():
         SPRINT_VIEW_MAP[_sp_id] = _view
 if CURRENT_SPRINT_ID:
     SPRINT_VIEW_MAP[CURRENT_SPRINT_ID] = CURRENT_SPRINT_VIEW_ID
+
+# ── AUTO-DETECCAO DO SPRINT ATUAL ─────────────────────────────────
+# Quando CLICKUP_SPRINTS_FOLDER_ID estiver definido, lista os sprints
+# do folder no ClickUp e detecta o sprint cuja janela [start, due]
+# contem a data atual. Sobrescreve as variaveis CURRENT_SPRINT_* em
+# runtime SEM reescrever o arquivo .env. O sprint anterior do .env
+# (se diferente do detectado) e movido para a lista de historicos
+# preservando seu view ID, se existir.
+SPRINTS_FOLDER_ID = os.environ.get("CLICKUP_SPRINTS_FOLDER_ID", "").strip()
+SPRINT_AUTO_DETECT = os.environ.get("CLICKUP_SPRINT_AUTO_DETECT", "1").strip().lower() not in ("0", "false", "no", "")
+# Captura "Sprint N" e, se houver, a janela "(DD/MM/AA - DD/MM/AA)" no nome
+# da List (formato BR). O ClickUp guarda datas erradas em start_date/due_date,
+# entao o nome e a fonte de verdade.
+_SPRINT_NAME_RE = re.compile(
+    r"sprint\s*(\d+)\s*(?:\(\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*-\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*\))?",
+    re.IGNORECASE,
+)
+
+
+def _parse_br_date(s):
+    """Parse DD/MM/AA ou DD/MM/AAAA (formato BR) para datetime. None se invalido."""
+    try:
+        parts = s.split("/")
+        d, m, y = int(parts[0]), int(parts[1]), int(parts[2])
+        if y < 100:
+            y += 2000
+        return datetime(y, m, d)
+    except (ValueError, IndexError):
+        return None
+
+
+def _fetch_folder_lists_raw(folder_id):
+    if not CLICKUP_TOKEN or not folder_id:
+        return []
+    url = f"https://api.clickup.com/api/v2/folder/{folder_id}/list?archived=false"
+    req = urllib.request.Request(url, headers={"Authorization": CLICKUP_TOKEN})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(response.read())
+            return data.get("lists", [])
+    except Exception as e:
+        print(f"[auto-sprint] Folder lists fetch error: {e}")
+        return []
+
+
+def _fetch_list_gantt_view_id(list_id):
+    """Retorna o ID da view tipo 'gantt' da List (fonte de verdade do sprint
+    no padrao da Wolf — agrega subtasks). None se nao houver."""
+    if not CLICKUP_TOKEN or not list_id:
+        return None
+    url = f"https://api.clickup.com/api/v2/list/{list_id}/view"
+    req = urllib.request.Request(url, headers={"Authorization": CLICKUP_TOKEN})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(response.read())
+        for v in data.get("views", []):
+            if v.get("type") == "gantt":
+                return v.get("id")
+    except Exception as e:
+        print(f"[auto-sprint] Erro ao buscar views da list {list_id}: {e}")
+    return None
+
+
+def _discover_active_sprint(folder_id):
+    """Procura no folder a List cujo nome contem 'Sprint N (DD/MM/AA - DD/MM/AA)'
+    e cuja janela contem hoje. As datas do ClickUp (start_date/due_date) sao
+    ignoradas porque o time as preenche errado — a fonte de verdade e o nome.
+    Retorna dict {id, label, start_date_iso, num} ou None."""
+    lists = _fetch_folder_lists_raw(folder_id)
+    if not lists:
+        return None
+    today = datetime.now().date()
+    parsed = []
+    for lst in lists:
+        name = lst.get("name") or ""
+        m = _SPRINT_NAME_RE.search(name)
+        if not m:
+            continue
+        sp_num = int(m.group(1))
+        start_dt = _parse_br_date(m.group(2)) if m.group(2) else None
+        end_dt = _parse_br_date(m.group(3)) if m.group(3) else None
+        if start_dt is None:
+            continue
+        parsed.append({
+            "id": str(lst.get("id")),
+            "name": name,
+            "num": sp_num,
+            "start": start_dt,
+            "end": end_dt,
+        })
+    if not parsed:
+        return None
+    active = [
+        c for c in parsed
+        if c["start"].date() <= today and (c["end"] is None or today <= c["end"].date())
+    ]
+    if active:
+        active.sort(key=lambda c: c["num"], reverse=True)
+        chosen = active[0]
+    else:
+        started = [c for c in parsed if c["start"].date() <= today]
+        if not started:
+            return None
+        started.sort(key=lambda c: c["start"], reverse=True)
+        chosen = started[0]
+    return {
+        "id": chosen["id"],
+        "label": f"Sprint {chosen['num']}",
+        "start_date_iso": chosen["start"].strftime("%Y-%m-%d"),
+        "num": chosen["num"],
+    }
+
+
+# TTL da checagem periodica em runtime (default 30 min). Cada chamada a
+# get_production_metrics() consulta o folder no maximo a cada SPRINT_CHECK_TTL
+# segundos, evitando hits excessivos na API do ClickUp.
+SPRINT_CHECK_TTL = int(os.environ.get("CLICKUP_SPRINT_CHECK_TTL", 1800))
+_LAST_SPRINT_CHECK = {"ts": 0.0}
+_SPRINT_CHECK_LOCK = threading.Lock()
+
+
+def _apply_sprint_rotation(detected, source="boot"):
+    """Aplica rotacao do sprint atual mutando as globais. Retorna True se houve troca.
+    Movido o sprint anterior para o historico, preservando seu view_id."""
+    global CURRENT_SPRINT_ID, CURRENT_SPRINT_LABEL, CURRENT_SPRINT_START_DATE, CURRENT_SPRINT_VIEW_ID
+    if not detected or not detected.get("id"):
+        return False
+    if detected["id"] == CURRENT_SPRINT_ID:
+        return False
+    print(f"[auto-sprint:{source}] Sprint ativo detectado: {detected['label']} ({detected['id']}), inicio={detected['start_date_iso']}")
+    print(f"[auto-sprint:{source}] Sprint anterior: {CURRENT_SPRINT_LABEL} ({CURRENT_SPRINT_ID}) -> movendo para historico")
+    if CURRENT_SPRINT_ID and CURRENT_SPRINT_ID not in SPRINT_IDS:
+        SPRINT_IDS.append(CURRENT_SPRINT_ID)
+        SPRINT_LABEL_MAP[CURRENT_SPRINT_ID] = CURRENT_SPRINT_LABEL
+        if CURRENT_SPRINT_VIEW_ID:
+            SPRINT_VIEW_MAP[CURRENT_SPRINT_ID] = CURRENT_SPRINT_VIEW_ID
+    CURRENT_SPRINT_ID = detected["id"]
+    CURRENT_SPRINT_LABEL = detected["label"]
+    CURRENT_SPRINT_START_DATE = detected["start_date_iso"]
+    # Auto-descobre a view Gantt do sprint (fonte de verdade — agrega subtasks)
+    new_view_id = _fetch_list_gantt_view_id(CURRENT_SPRINT_ID)
+    CURRENT_SPRINT_VIEW_ID = new_view_id
+    if new_view_id:
+        SPRINT_VIEW_MAP[CURRENT_SPRINT_ID] = new_view_id
+        print(f"[auto-sprint:{source}] View Gantt do sprint atual: {new_view_id}")
+    else:
+        SPRINT_VIEW_MAP.pop(CURRENT_SPRINT_ID, None)
+        print(f"[auto-sprint:{source}] Nenhuma view Gantt encontrada — usara List API (sem subtasks)")
+    return True
+
+
+def check_sprint_rotation(force=False):
+    """Verifica periodicamente (TTL=SPRINT_CHECK_TTL) se o sprint ativo mudou no
+    ClickUp. Quando muda, aplica a rotacao em memoria e invalida o cache de
+    producao (chamado pelo proximo /api/clickup/production que vai recomputar).
+    Retorna True se rotacionou nesta chamada."""
+    if not (SPRINT_AUTO_DETECT and SPRINTS_FOLDER_ID and CLICKUP_TOKEN):
+        return False
+    now_ts = datetime.now().timestamp()
+    if not force and (now_ts - _LAST_SPRINT_CHECK["ts"]) < SPRINT_CHECK_TTL:
+        return False
+    with _SPRINT_CHECK_LOCK:
+        # double-check dentro do lock
+        now_ts = datetime.now().timestamp()
+        if not force and (now_ts - _LAST_SPRINT_CHECK["ts"]) < SPRINT_CHECK_TTL:
+            return False
+        try:
+            detected = _discover_active_sprint(SPRINTS_FOLDER_ID)
+            _LAST_SPRINT_CHECK["ts"] = now_ts
+            rotated = _apply_sprint_rotation(detected, source="runtime")
+            if rotated and _wolf_cache is not None:
+                try:
+                    if _wolf_cache.delete_cache("clickup_production"):
+                        print("[auto-sprint:runtime] Cache de producao invalidado.")
+                except Exception as ce:
+                    print(f"[auto-sprint:runtime] Falha ao invalidar cache: {ce}")
+            return rotated
+        except Exception as _auto_err:
+            print(f"[auto-sprint:runtime] Falha na checagem periodica: {_auto_err}")
+            return False
+
+
+# Boot: deteccao inicial no import. Erros nao quebram o import.
+if SPRINT_AUTO_DETECT and SPRINTS_FOLDER_ID and CLICKUP_TOKEN:
+    try:
+        _boot_detected = _discover_active_sprint(SPRINTS_FOLDER_ID)
+        _LAST_SPRINT_CHECK["ts"] = datetime.now().timestamp()
+        if not _apply_sprint_rotation(_boot_detected, source="boot"):
+            if _boot_detected:
+                print(f"[auto-sprint:boot] Sprint ativo confirmado: {_boot_detected['label']} ({_boot_detected['id']}) — sem mudanca")
+            else:
+                print("[auto-sprint:boot] Nenhum sprint ativo detectado no folder, mantendo configuracao do .env")
+    except Exception as _auto_err:
+        print(f"[auto-sprint:boot] Falha na auto-deteccao, mantendo .env: {_auto_err}")
 
 
 def normalize_string(s):
@@ -601,6 +797,49 @@ def get_team_for_disc(disc):
     return DISC_TO_TEAM.get(disc, "Geral")
 
 
+# Cache de fotos por nome normalizado (TTL=1h). Populado on-demand a partir
+# da API de membros do workspace (GET /team/{team_id}). Usado para injetar
+# fotos em pilotos do TEAM_MEMBERS_CONFIG que nao aparecem nas tasks do
+# sprint atual (caso comum no inicio de sprint).
+_MEMBER_PHOTO_CACHE = {"map": None, "ts": 0.0}
+_MEMBER_PHOTO_LOCK = threading.Lock()
+MEMBER_PHOTO_TTL = int(os.environ.get("CLICKUP_MEMBER_PHOTO_TTL", 3600))
+
+
+def get_member_photo_map():
+    """Retorna dict {nome_normalizado: profilePicture_url}. Cache de TTL=1h."""
+    now_ts = datetime.now().timestamp()
+    cached = _MEMBER_PHOTO_CACHE
+    if cached["map"] is not None and (now_ts - cached["ts"]) < MEMBER_PHOTO_TTL:
+        return cached["map"]
+    with _MEMBER_PHOTO_LOCK:
+        if cached["map"] is not None and (now_ts - cached["ts"]) < MEMBER_PHOTO_TTL:
+            return cached["map"]
+        result = {}
+        if not CLICKUP_TOKEN or not TEAM_ID:
+            cached["map"] = result
+            cached["ts"] = now_ts
+            return result
+        url = f"https://api.clickup.com/api/v2/team/{TEAM_ID}"
+        req = urllib.request.Request(url, headers={"Authorization": CLICKUP_TOKEN})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                data = json.loads(response.read())
+            for m in data.get("team", {}).get("members", []):
+                u = m.get("user", {}) or {}
+                photo = u.get("profilePicture")
+                if not photo:
+                    continue
+                username = u.get("username") or ""
+                result[normalize_string(username)] = photo
+            print(f"[member-photos] Cache populado: {len(result)} fotos")
+        except Exception as e:
+            print(f"[member-photos] Erro ao buscar membros: {e}")
+        cached["map"] = result
+        cached["ts"] = now_ts
+        return result
+
+
 def get_role(assignee_name, disc):
     norm_name = normalize_string(assignee_name)
     config = TEAM_MEMBERS_CONFIG.get(norm_name)
@@ -935,6 +1174,10 @@ def get_production_metrics(force_refresh=False):
     if not CLICKUP_TOKEN:
         return {"error": "Missing ClickUp API token.", "status": "error"}
 
+    # Antes de calcular, verifica se o sprint atual rotacionou no ClickUp.
+    # No-op na maioria das chamadas (TTL=SPRINT_CHECK_TTL).
+    check_sprint_rotation()
+
     # ── Current Sprint: use Views API for accurate data ──
     current_pilots = []
     current_total_tasks = 0
@@ -1115,6 +1358,11 @@ def get_production_metrics(force_refresh=False):
     # Aliases: longer names that duplicate a shorter entry (skip them)
     _CONFIG_ALIASES = {"ANA BEATRIZ DA SILVA COSTA"}  # covered by "ANA BEATRIZ"
     existing_norms = {normalize_string(p["name"]) for p in current_pilots}
+    photo_map = get_member_photo_map()
+    # Tambem aplica fotos do workspace em pilotos vindos das tasks que nao receberam profilePicture
+    for p in current_pilots:
+        if not p.get("photo"):
+            p["photo"] = photo_map.get(normalize_string(p["name"]))
     for member_name, cfg in TEAM_MEMBERS_CONFIG.items():
         if member_name in _CONFIG_ALIASES:
             continue
@@ -1131,7 +1379,7 @@ def get_production_metrics(force_refresh=False):
                 "assigned": 0,
                 "doing": 0,
                 "done": 0,
-                "photo": None,
+                "photo": photo_map.get(member_name),
                 "ageAvg": 0,
                 "doingCount": 0,
                 "isAcademy": cfg["role"] == "ACADEMY",

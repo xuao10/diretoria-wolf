@@ -92,6 +92,12 @@ def _refresh_clickup_production_async(force_refresh=False):
 def get_clickup_production():
     """Retorna metricas de producao do ClickUp (cache-first com stale-while-revalidate)."""
     force = request.args.get('refresh') == '1'
+    # Auto-deteccao do sprint atual: se houver rotacao, ja invalida o cache
+    # internamente, entao o load abaixo retornara None e cairemos no MISS.
+    try:
+        clickup_sync.check_sprint_rotation()
+    except Exception as _e:
+        print(f"⚠️ check_sprint_rotation falhou: {_e}")
     cached, _ = wolf_cache.load_cache("clickup_production")
     age = wolf_cache.cache_age_seconds("clickup_production")
 

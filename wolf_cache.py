@@ -117,6 +117,19 @@ def cache_age_seconds(key):
         return None
 
 
+def delete_cache(key):
+    """Remove o cache. Retorna True se removeu, False se nao existia."""
+    filepath = CACHE_DIR / f"{key}.json"
+    with _lock:
+        try:
+            filepath.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+
+
 # ─── STARTUP: Restore status from disk if available ────────────────
 def _restore_status_from_disk():
     """On import, try to restore the last-known status from disk."""
