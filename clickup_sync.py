@@ -430,19 +430,26 @@ def compute_pe_calibrada(team_historical_pts, pilots):
 
 
 
+PE_INDIVIDUAL_TOP_N = int(os.environ.get("PE_INDIVIDUAL_TOP_N", 3))
+
+
 def compute_pe_individual(pilot_history_norm, pilots):
-    """PE Individual (Carro Fantasma): histórico real pessoal calibrado.
-    Calcula a média do histórico pessoal (normalizado p/ 40h) e aplica multiplicador e carga atual.
+    """PE Individual (Carro Fantasma): media dos TOP-N melhores sprints
+    pessoais do piloto (default N=3), normalizados para 40h, com multiplicador
+    do papel e ajuste pela carga horaria atual. Configuravel via env
+    PE_INDIVIDUAL_TOP_N.
+
+    Atualiza automaticamente conforme novos sprints entram no historico —
+    sprints fracos nao reduzem se ja existirem 3 melhores acima deles.
     """
-    # Verificamos se há histórico suficiente para o boost (facultativo)
+    # Boost de 5% se o piloto tiver historico suficiente para o ranking
     num_sprints = 0
     if pilot_history_norm:
         all_s_ids = set()
         for h in pilot_history_norm.values():
             all_s_ids.update(h.keys())
         num_sprints = len(all_s_ids)
-    
-    apply_boost = num_sprints >= 3  # ×1.05 a partir de 3 sprints históricos
+    apply_boost = num_sprints >= PE_INDIVIDUAL_TOP_N  # boost so quando ha base estatistica
 
     has_any_assigned = any(p.get("assigned", 0) > 0 for p in pilots)
 
@@ -458,16 +465,17 @@ def compute_pe_individual(pilot_history_norm, pilots):
         hist = pilot_history_norm.get(norm, {})
         if hist:
             done_values = list(hist.values())
-            avg_40h = sum(done_values) / len(done_values)
-            
+            top_values = sorted(done_values, reverse=True)[:PE_INDIVIDUAL_TOP_N]
+            avg_40h = sum(top_values) / len(top_values)
+
             if apply_boost:
                 avg_40h *= 1.05
-            
+
             # Aplica o multiplicador do papel E a carga horária proporcional (base 40h)
             tier_name = _MEMBER_TIER.get(norm, "MESMA_PRATELEIRA")
             mult = TIER_CONFIG.get(tier_name, {}).get("mult", 1.0)
             h_factor = p.get("hours_week", 40) / 40.0
-            
+
             p["pe_individual"] = round(avg_40h * mult * h_factor, 1)
         else:
             p["pe_individual"] = 0
