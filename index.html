@@ -10891,38 +10891,229 @@
 
       function stop() {}
 
+      // Constroi payload no formato dados_diarios: meta, resumo, alertas,
+      // equipes agrupadas e regras. Calcula carga (assigned/pe_sprint), LF
+      // e pace via dias_uteis_passados, e classifica status pela regra mais
+      // severa que dispara para cada piloto.
+      function _buildExportPayload(data) {
+        var INACTIVE = ['Julio Cesar', 'Caio Cesar'];
+        var pilots = (data.pilots || []).filter(function(p) {
+          return INACTIVE.indexOf(p.name) === -1 && (p.team === 'HID' || p.team === 'ELE');
+        });
+        var diasTotal = data.dias_uteis_total || 10;
+        var diasPassados = Math.max(1, data.dias_uteis_passados || 1);
+
+        function paceStr(target_per_day, done) {
+          if (!target_per_day || target_per_day <= 0) return '+0%';
+          var expected = target_per_day * diasPassados;
+          if (expected <= 0) return '+0%';
+          var pct = Math.round((done - expected) / expected * 100);
+          return (pct >= 0 ? '+' : '') + pct + '%';
+        }
+        function paceNum(target_per_day, done) {
+          if (!target_per_day || target_per_day <= 0) return 0;
+          var expected = target_per_day * diasPassados;
+          if (expected <= 0) return 0;
+          return Math.round((done - expected) / expected * 100);
+        }
+
+        var SEV_INFO = {
+          'SOBRECARGA_EXTREMA': { sev: '🔴 CRÍTICO',  rank: 4, acao: 'Redistribuir tarefas URGENTE. Verificar se está travado.' },
+          'PARADO_TOTAL':       { sev: '🔴 CRÍTICO',  rank: 4, acao: 'Contatar piloto imediatamente. Verificar impedimentos.' },
+          'SEM_ENTREGAS':       { sev: '🔴 CRÍTICO',  rank: 4, acao: 'Verificar se as tarefas estão em andamento ou se há bloqueios.' },
+          'GARGALO_ATIVO':      { sev: '🟠 ALERTA',   rank: 3, acao: 'Investigar a tarefa travada e desbloquear.' },
+          'SOBRECARGA':         { sev: '🟠 ALERTA',   rank: 3, acao: 'Monitorar carga. Considerar redistribuir.' },
+          'OCIOSIDADE':         { sev: '🟡 ATENÇÃO',  rank: 2, acao: 'Confirmar disponibilidade e alocar tarefas.' },
+          'TOP_PERFORMER':      { sev: '✅ DESTAQUE', rank: 1, acao: 'Reconhecer performance. Avaliar se pode mentorar outros.' }
+        };
+
+        var enriched = pilots.map(function(p) {
+          var assigned = p.assigned || 0;
+          var done = p.done || 0;
+          var doing = p.doing || 0;
+          var pe_sprint = p.pe_sprint || 0;
+          var pe_calibrado = p.pe_calibrada || 0;
+          var pe_individual = p.pe_individual || 0;
+          var hours_week = p.hours_week || 40;
+          var tracked_hours = Math.round((p.tracked_hours || 0) * 10) / 10;
+          var gargalo = p.gargaloScore || 0;
+          var doingCount = p.doingCount || 0;
+
+          var carga_pct = pe_sprint > 0 ? Math.round(assigned / pe_sprint * 100) : 0;
+          var lf_atrib = Math.round(assigned / diasTotal);
+          var lf_sprint = Math.round(pe_sprint / diasTotal);
+          var lf_calib = Math.round(pe_calibrado / diasTotal);
+          var pace_atrib_n = paceNum(lf_atrib, done);
+
+          var alerts = [];
+          if (carga_pct > 150) alerts.push('SOBRECARGA_EXTREMA');
+          if (assigned > 0 && doing === 0 && done === 0) alerts.push('PARADO_TOTAL');
+          if (doing > 0 && done === 0) alerts.push('SEM_ENTREGAS');
+          if (gargalo > 0) alerts.push('GARGALO_ATIVO');
+          if (carga_pct > 130 && carga_pct <= 150) alerts.push('SOBRECARGA');
+          if (assigned > 0 && carga_pct < 60) alerts.push('OCIOSIDADE');
+          if (done > 10 && pace_atrib_n > 50) alerts.push('TOP_PERFORMER');
+
+          var maxRank = alerts.reduce(function(m, t) { return Math.max(m, SEV_INFO[t].rank); }, 0);
+          var status;
+          if (alerts.indexOf('TOP_PERFORMER') >= 0 && maxRank <= 1) status = '✅ DESTAQUE';
+          else if (maxRank === 4) status = '🔴 CRÍTICO';
+          else if (maxRank === 3) status = '🟠 ALERTA';
+          else if (maxRank === 2) status = '🟡 ATENÇÃO';
+          else status = '✅ OK';
+
+          var consistencia = Math.min(5, (p.recent_done_tasks || []).length) + '/5';
+
+          return {
+            raw: p, assigned: assigned, done: done, doing: doing,
+            doingCount: doingCount, pe_sprint: pe_sprint, pe_calibrado: pe_calibrado,
+            pe_individual: pe_individual, hours_week: hours_week, tracked_hours: tracked_hours,
+            gargalo: gargalo, carga_pct: carga_pct,
+            lf_atrib: lf_atrib, lf_sprint: lf_sprint, lf_calib: lf_calib,
+            pace_atrib: paceStr(lf_atrib, done), pace_sprint: paceStr(lf_sprint, done), pace_calib: paceStr(lf_calib, done),
+            alerts: alerts, status: status, consistencia: consistencia
+          };
+        });
+
+        var resumo = {};
+        ['ELE', 'HID'].forEach(function(team) {
+          var tp = enriched.filter(function(pe) { return pe.raw.team === team; });
+          resumo[team] = {
+            total_pilotos: tp.length,
+            pts_atrib_total: tp.reduce(function(s, pe) { return s + pe.assigned; }, 0),
+            done_total: tp.reduce(function(s, pe) { return s + pe.done; }, 0),
+            doing_total: tp.reduce(function(s, pe) { return s + pe.doing; }, 0),
+            pilotos_com_gargalo: tp.filter(function(pe) { return pe.gargalo > 0; }).length
+          };
+        });
+
+        var alertas = [];
+        enriched.forEach(function(pe) {
+          pe.alerts.forEach(function(t) {
+            var info = SEV_INFO[t];
+            var detalhe = '';
+            switch (t) {
+              case 'SOBRECARGA_EXTREMA':
+                detalhe = 'Carga em ' + pe.carga_pct + '% — mais do que o dobro da capacidade. ' + pe.doingCount + ' tarefas doing, ' + pe.done + ' done.';
+                break;
+              case 'PARADO_TOTAL':
+                detalhe = '0 doing, 0 done — nenhuma atividade registrada. Carga ' + pe.carga_pct + '%, ' + pe.assigned + ' pts atribuídos.';
+                break;
+              case 'SEM_ENTREGAS':
+                detalhe = pe.doingCount + ' doing, 0 done. Pace ' + pe.pace_atrib + ' em todos os eixos.';
+                break;
+              case 'GARGALO_ATIVO':
+                detalhe = pe.gargalo + ' gargalo(s) identificado(s). ' + pe.doingCount + ' doing, ' + pe.done + ' done. Pace ' + pe.pace_atrib + '.';
+                break;
+              case 'SOBRECARGA':
+                detalhe = 'Carga ' + pe.carga_pct + '% com ' + pe.assigned + ' pts atribuídos.';
+                break;
+              case 'OCIOSIDADE':
+                detalhe = 'Carga em apenas ' + pe.carga_pct + '%. PE individual ' + pe.pe_individual + ' vs PE sprint ' + pe.pe_sprint + '.';
+                break;
+              case 'TOP_PERFORMER':
+                detalhe = pe.done + ' done, ' + pe.doingCount + ' doing. Pace ' + pe.pace_atrib + ' a ' + pe.pace_calib + '. Entregando acima do esperado.';
+                break;
+            }
+            alertas.push({
+              severidade: info.sev,
+              tipo: t,
+              piloto: pe.raw.name,
+              tag: pe.raw.team,
+              detalhe: detalhe,
+              acao_sugerida: info.acao
+            });
+          });
+        });
+        var SEV_ORDER = { '🔴 CRÍTICO': 0, '🟠 ALERTA': 1, '🟡 ATENÇÃO': 2, '✅ DESTAQUE': 3 };
+        alertas.sort(function(a, b) { return (SEV_ORDER[a.severidade] || 99) - (SEV_ORDER[b.severidade] || 99); });
+
+        var contagem = { critico: 0, alerta: 0, atencao: 0, destaque: 0 };
+        alertas.forEach(function(a) {
+          if (a.severidade.indexOf('CRÍTICO') >= 0) contagem.critico++;
+          else if (a.severidade.indexOf('ALERTA') >= 0) contagem.alerta++;
+          else if (a.severidade.indexOf('ATENÇÃO') >= 0) contagem.atencao++;
+          else if (a.severidade.indexOf('DESTAQUE') >= 0) contagem.destaque++;
+        });
+
+        var equipes = {};
+        ['ELE', 'HID'].forEach(function(team) {
+          equipes[team] = enriched
+            .filter(function(pe) { return pe.raw.team === team; })
+            .map(function(pe) {
+              return {
+                piloto: pe.raw.name,
+                status: pe.status,
+                pontos: {
+                  atribuidos: pe.assigned,
+                  pe_sprint: pe.pe_sprint,
+                  pe_calibrado: pe.pe_calibrado,
+                  pe_individual: pe.pe_individual
+                },
+                fluxo: {
+                  doing: pe.doing,
+                  done: pe.done,
+                  carga: pe.carga_pct + '%',
+                  horas: pe.tracked_hours + 'h/' + pe.hours_week + 'h'
+                },
+                leadtime_e_pace: {
+                  lf_atribuido: pe.lf_atrib,
+                  pace_atribuido: pe.pace_atrib,
+                  lf_sprint: pe.lf_sprint,
+                  pace_sprint: pe.pace_sprint,
+                  lf_calibrado: pe.lf_calib,
+                  pace_calibrado: pe.pace_calib
+                },
+                saude: {
+                  gargalo: pe.gargalo,
+                  consistencia: pe.consistencia
+                }
+              };
+            });
+        });
+
+        return {
+          meta: {
+            gerado_em: new Date().toISOString(),
+            sprint: data.current_sprint_label || 'Sprint',
+            dia_sprint: 'Dia ' + diasPassados + ' de ' + diasTotal,
+            total_pilotos: enriched.length,
+            equipes: ['ELE', 'HID']
+          },
+          resumo_geral: resumo,
+          alertas: alertas,
+          contagem_alertas: contagem,
+          equipes: equipes,
+          regras_de_alerta: {
+            descricao: 'Regras usadas para gerar os alertas automaticamente',
+            regras: [
+              { tipo: 'SOBRECARGA_EXTREMA', condicao: 'carga > 150%',                          severidade: '🔴 CRÍTICO' },
+              { tipo: 'PARADO_TOTAL',       condicao: 'doing == 0 AND done == 0 AND assigned > 0', severidade: '🔴 CRÍTICO' },
+              { tipo: 'SEM_ENTREGAS',       condicao: 'done == 0 AND doing > 0',                severidade: '🔴 CRÍTICO' },
+              { tipo: 'GARGALO_ATIVO',      condicao: 'gargaloScore > 0 (tarefa travada 3+ dias)', severidade: '🟠 ALERTA'  },
+              { tipo: 'SOBRECARGA',         condicao: 'carga > 130% AND <= 150%',               severidade: '🟠 ALERTA'  },
+              { tipo: 'OCIOSIDADE',         condicao: 'carga < 60% AND assigned > 0',           severidade: '🟡 ATENÇÃO' },
+              { tipo: 'TOP_PERFORMER',      condicao: 'done > 10 AND pace_atribuido > +50%',    severidade: '✅ DESTAQUE' }
+            ]
+          }
+        };
+      }
+
       function exportJSON() {
         var btn = document.getElementById('prod-btn-export');
         var origText = btn ? btn.textContent : '';
         if (btn) { btn.textContent = '⏳ EXPORTANDO...'; btn.disabled = true; }
-        // Sempre busca a versao mais fresca pra exportar (ignora cache local)
         fetch('/api/clickup/production?refresh=1', { cache: 'no-store' })
-          .then(function(r) {
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            return r.json();
-          })
+          .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
           .then(function(data) {
-            var nowIso = new Date().toISOString();
+            var payload = _buildExportPayload(data);
             var sprintLabel = (data.current_sprint_label || 'sprint').toLowerCase().replace(/\s+/g, '_');
-            var datePart = nowIso.slice(0, 10);
-            var payload = {
-              exported_at: nowIso,
-              source: 'wolf_dashboard_production',
-              endpoint: '/api/clickup/production',
-              sprint: {
-                id: data.current_sprint_id || null,
-                label: data.current_sprint_label || null,
-                start_date: data.sprint_start_date || null,
-                dias_uteis_total: data.dias_uteis_total || null,
-                dias_uteis_passados: data.dias_uteis_passados || null
-              },
-              metrics: data
-            };
-            var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+            var datePart = new Date().toISOString().slice(0, 10);
+            var blob = new Blob([JSON.stringify(payload, null, 4)], { type: 'application/json;charset=utf-8' });
             var url = URL.createObjectURL(blob);
             var a = document.createElement('a');
             a.href = url;
-            a.download = 'wolf_metrics_' + sprintLabel + '_' + datePart + '.json';
+            a.download = 'dados_diarios_' + sprintLabel + '_' + datePart + '.json';
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
