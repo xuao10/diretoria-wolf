@@ -8,7 +8,28 @@ import unicodedata
 import sys
 import concurrent.futures
 from datetime import datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except ImportError:
+    ZoneInfo = None
 from dotenv import load_dotenv
+
+# Timezone fixo para todos os calculos de data/atribuicao de tasks por dia.
+# Sem isso, datetime.fromtimestamp() usa o TZ do SO (UTC na VPS, America/Sao_Paulo
+# no Windows local), o que faz tasks fechadas perto da meia-noite caires em
+# dias diferentes em cada ambiente. CLICKUP_TIMEZONE permite override.
+_TZ_NAME = os.environ.get("CLICKUP_TIMEZONE", "America/Sao_Paulo")
+PROJECT_TZ = ZoneInfo(_TZ_NAME) if ZoneInfo else None
+
+
+def ts_to_local_dt(ms):
+    """Converte timestamp em ms (epoch UTC do ClickUp) para datetime no timezone
+    do projeto. Retorna naive datetime no horario local do projeto, para que
+    .strftime('%Y-%m-%d') gere a data correta consistentemente."""
+    if PROJECT_TZ is not None:
+        return datetime.fromtimestamp(int(ms) / 1000, tz=PROJECT_TZ).replace(tzinfo=None)
+    # Fallback se zoneinfo nao estiver disponivel: assume UTC-3 manualmente
+    return datetime.fromtimestamp(int(ms) / 1000) - timedelta(hours=0)
 
 try:
     import wolf_cache as _wolf_cache
@@ -522,7 +543,7 @@ def compute_telemetry(current_pilots, tasks, start_dt, end_dt):
             pts = t.get('points') or 0
             dc = t.get('date_closed') or t.get('date_updated')
             if dc and pts > 0:
-                dt_str = datetime.fromtimestamp(int(dc)/1000).strftime('%Y-%m-%d')
+                dt_str = ts_to_local_dt(dc).strftime('%Y-%m-%d')
                 for a in t.get('assignees', []):
                     assignee_norm = normalize_string(a.get('username'))
                     if assignee_norm in daily_done_all and dt_str in daily_done_all[assignee_norm]:
@@ -700,7 +721,7 @@ def get_sprint_tracked_hours(sprint_start_dt):
         norm = normalize_string(username)
         duration_ms = int(entry.get("duration", 0))
         entry_start_ms = int(entry.get("start", 0))
-        entry_dt = datetime.fromtimestamp(entry_start_ms / 1000.0)
+        entry_dt = ts_to_local_dt(entry_start_ms)
         
         if entry_dt < week1_end:
             user_hours_wk1[norm] = user_hours_wk1.get(norm, 0) + duration_ms
@@ -1151,7 +1172,7 @@ def process_sprint_tasks(tasks):
                 p["done"] += task_points
                 # Registra tarefa concluída para o modal de detalhe
                 dc_ts = t.get('date_closed') or t.get('date_updated')
-                done_date_str = datetime.fromtimestamp(int(dc_ts)/1000).strftime('%d/%m') if dc_ts else ''
+                done_date_str = ts_to_local_dt(dc_ts).strftime('%d/%m') if dc_ts else ''
                 p["recent_done_tasks"].append({
                     "name": t.get('name', 'Sem nome'),
                     "points": task_points,
@@ -1322,7 +1343,7 @@ def get_production_metrics(force_refresh=False):
                 # Burndown plot data
                 ts_val = t.get('date_closed') or t.get('date_updated')
                 if ts_val:
-                    dt_str = datetime.fromtimestamp(int(ts_val)/1000).strftime('%Y-%m-%d')
+                    dt_str = ts_to_local_dt(ts_val).strftime('%Y-%m-%d')
                     burndown_data[dt_str] = burndown_data.get(dt_str, 0) + pts
             
             elif status_name in DOING_STATUSES:
